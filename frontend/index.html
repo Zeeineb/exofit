@@ -230,7 +230,38 @@ textarea { resize: vertical; min-height: 72px; }
             Formats supportes : JSON, CSV, TSV, TXT, MD ou DOCX.
           </div>
           <div id="clinical-file-status" style="margin-top:8px; font-size:13px; color:var(--blue-dark); display:none;"></div>
+          <div style="margin-top:16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+            <select id="parsed-case-select" style="min-width:420px">
+              <option value="">Chargement des documents JSON...</option>
+            </select>
+            <button class="btn btn-outline" onclick="diagnoseSelectedCase()">Utiliser le JSON selectionne</button>
+            <button class="btn btn-outline" onclick="refreshClinicalCases()">Actualiser la liste</button>
+          </div>
+          <div id="parsed-case-meta" style="margin-top:8px; font-size:13px; color:var(--text-muted);">
+            Aucun document JSON charge.
+          </div>
         </div>
+
+        <div class="card">
+          <div class="card-title">Choisir le modele IA</div>
+          <div class="form-group" style="max-width:360px; margin-bottom:0;">
+            <label>Provider LLM utilise pour le diagnostic</label>
+            <select id="llm-provider">
+              <option value="">Par defaut du backend</option>
+              <option value="huggingface">Hugging Face</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="qwen">Qwen</option>
+              <option value="mistral">Mistral</option>
+              <option value="openai">OpenAI</option>
+              <option value="google">Google</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div style="margin-top:8px; font-size:13px; color:var(--text-muted);">
+            Si la cle API du provider choisi n'est pas configuree, le backend peut repasser en mode demo.
+          </div>
+        </div>
+
 
         <div class="card">
           <div class="card-title">Identité & anthropométrie</div>
@@ -389,7 +420,7 @@ textarea { resize: vertical; min-height: 72px; }
 
         <div class="card" id="ecg-preview" style="display:none">
           <div class="card-title">Aperçu du signal ECG</div>
-          <canvas id="ecg-canvas" style="width:100%;height:140px;background:#fff5f5;border-radius:6px;display:block;"></canvas>
+          <div id="ecg-preview-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;"></div>
         </div>
       </div>
 
@@ -449,7 +480,9 @@ const API = 'http://localhost:8000/api';
 let currentRole = 'infirmiere';
 let currentDiagnostic = null;
 let currentECGResult = null;
+let currentECGPlotData = null;
 let currentClinicalFile = null;
+let clinicalCasesCache = [];
 const validations = JSON.parse(localStorage.getItem('exofit_validations') || '[]');
 
 // ── SYMPTÔMES & EXAMENS ──
@@ -501,6 +534,16 @@ function getChecked(prefix) {
   return [...document.querySelectorAll(`[id^="${prefix}"].checked input`)].map(i => i.value);
 }
 
+function setCheckedValues(prefix, values) {
+  const selected = new Set(values || []);
+  document.querySelectorAll(`[id^="${prefix}"]`).forEach(label => {
+    const cb = label.querySelector('input');
+    const checked = selected.has(cb.value);
+    cb.checked = checked;
+    label.classList.toggle('checked', checked);
+  });
+}
+
 // ── NAVIGATION ──
 function setRole(role) {
   currentRole = role;
@@ -519,6 +562,9 @@ function showPage(id) {
   const ni = [...document.querySelectorAll('.nav-item')].find(n => n.getAttribute('onclick')?.includes(id));
   if (ni) ni.classList.add('active');
   if (id === 'med-stats') loadStats();
+  if (id === 'p2-result' && currentECGResult) {
+    requestAnimationFrame(() => renderECGResult(currentECGResult));
+  }
 }
 
 // ── DIAGNOSTIC IA ──
@@ -534,9 +580,17 @@ function handleClinicalFileSelection(input) {
   status.textContent = `Document selectionne : ${currentClinicalFile.name}. Le bouton "Obtenir diagnostic IA" utilisera ce document en priorite.`;
 }
 
+function getSelectedLLMProvider() {
+  return document.getElementById('llm-provider')?.value || '';
+}
+
 async function submitDiagnostic() {
   if (currentClinicalFile) {
     await uploadClinicalFile();
+    return;
+  }
+  if (document.getElementById('parsed-case-select')?.value) {
+    await diagnoseSelectedCase();
     return;
   }
   const age = document.getElementById('age').value;
@@ -569,18 +623,19 @@ async function submitDiagnostic() {
   document.getElementById('loader-diagnostic').classList.add('active');
 
   try {
-    const res = await fetch(`${API}/diagnostic`, {
+    const provider = getSelectedLLMProvider();
+    const url = provider ? `${API}/diagnostic?provider=${encodeURIComponent(provider)}` : `${API}/diagnostic`;
+    const res = await fetch(url, {
       method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(patient)
     });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) throw new Error(await extractBackendError(res));
     const data = await res.json();
     currentDiagnostic = { patient, result: data, timestamp: new Date().toISOString(), id: 'cas_' + Date.now() };
     renderDiagnosticResult(data);
     showPage('p1-result');
   } catch(e) {
-    // Mode démo offline
-    currentDiagnostic = { patient, result: getDemoResult(patient), timestamp: new Date().toISOString(), id: 'cas_' + Date.now() };
-    renderDiagnosticResult(currentDiagnostic.result);
+    currentDiagnostic = null;
+    renderDiagnosticError(`Echec du diagnostic backend: ${e.message}`);
     showPage('p1-result');
   } finally {
     document.getElementById('loader-diagnostic').classList.remove('active');
@@ -597,8 +652,10 @@ async function uploadClinicalFile() {
   document.getElementById('loader-diagnostic').classList.add('active');
 
   try {
-    const res = await fetch(`${API}/diagnostic/from-file`, { method: 'POST', body: formData });
-    if (!res.ok) throw new Error(await res.text());
+    const provider = getSelectedLLMProvider();
+    const url = provider ? `${API}/diagnostic/from-file?provider=${encodeURIComponent(provider)}` : `${API}/diagnostic/from-file`;
+    const res = await fetch(url, { method: 'POST', body: formData });
+    if (!res.ok) throw new Error(await extractBackendError(res));
     const data = await res.json();
     currentDiagnostic = {
       patient: { source_fichier: file.name },
@@ -609,10 +666,110 @@ async function uploadClinicalFile() {
     renderDiagnosticResult(data);
     showPage('p1-result');
   } catch (e) {
-    alert(`Import du dossier clinique impossible: ${e.message}`);
+    currentDiagnostic = null;
+    renderDiagnosticError(`Import du dossier clinique impossible: ${e.message}`);
+    showPage('p1-result');
   } finally {
     document.getElementById('loader-diagnostic').classList.remove('active');
   }
+}
+
+async function extractBackendError(response) {
+  const prefix = `HTTP ${response.status}`;
+  try {
+    const payload = await response.json();
+    if (typeof payload?.detail === 'string' && payload.detail.trim()) return `${prefix} - ${payload.detail}`;
+    if (payload?.detail) return `${prefix} - ${JSON.stringify(payload.detail)}`;
+    return `${prefix} - ${JSON.stringify(payload)}`;
+  } catch {
+    const raw = await response.text();
+    return raw ? `${prefix} - ${raw}` : prefix;
+  }
+}
+
+async function refreshClinicalCases() {
+  const select = document.getElementById('parsed-case-select');
+  const meta = document.getElementById('parsed-case-meta');
+  select.innerHTML = '<option value="">Chargement des documents JSON...</option>';
+  meta.textContent = 'Chargement des documents JSON...';
+
+  try {
+    const res = await fetch(`${API}/clinical-cases`);
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    clinicalCasesCache = data.cases || [];
+
+    if (!clinicalCasesCache.length) {
+      select.innerHTML = '<option value="">Aucun document JSON disponible</option>';
+      meta.textContent = 'Aucun document JSON trouve dans data/cas_cliniques/parsed.';
+      return;
+    }
+
+    select.innerHTML = '<option value="">Selectionner un document JSON...</option>' +
+      clinicalCasesCache.map(item => `<option value="${item.id}">${item.filename}</option>`).join('');
+    meta.textContent = `${clinicalCasesCache.length} documents JSON disponibles.`;
+  } catch (e) {
+    select.innerHTML = '<option value="">Erreur de chargement</option>';
+    meta.textContent = `Impossible de charger la liste des documents JSON: ${e.message}`;
+  }
+}
+
+async function diagnoseSelectedCase() {
+  const select = document.getElementById('parsed-case-select');
+  const caseId = select.value;
+  if (!caseId) { alert('Selectionnez un document JSON'); return; }
+
+  document.getElementById('loader-diagnostic').classList.add('active');
+  try {
+    const res = await fetch(`${API}/clinical-cases/${caseId}`);
+    if (!res.ok) throw new Error(await extractBackendError(res));
+    const data = await res.json();
+    const patient = data.patient || {};
+    const provider = getSelectedLLMProvider();
+    const url = provider ? `${API}/diagnostic?provider=${encodeURIComponent(provider)}` : `${API}/diagnostic`;
+    const diagRes = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(patient)
+    });
+    if (!diagRes.ok) throw new Error(await extractBackendError(diagRes));
+    const result = await diagRes.json();
+    currentDiagnostic = {
+      patient,
+      result,
+      timestamp: new Date().toISOString(),
+      id: caseId
+    };
+    document.getElementById('parsed-case-meta').textContent = `Document JSON utilise: ${data.filename || caseId}`;
+    renderDiagnosticResult(result);
+    showPage('p1-result');
+  } catch (e) {
+    currentDiagnostic = null;
+    renderDiagnosticError(`Diagnostic depuis le document JSON impossible: ${e.message}`);
+    showPage('p1-result');
+  } finally {
+    document.getElementById('loader-diagnostic').classList.remove('active');
+  }
+}
+
+function fillPatientForm(patient) {
+  document.getElementById('age').value = patient.age ?? '';
+  document.getElementById('sexe').value = patient.sexe ?? '';
+  document.getElementById('taille').value = patient.taille_cm ?? '';
+  document.getElementById('poids').value = patient.poids_kg ?? '';
+  document.getElementById('ta_sys').value = patient.tension_systolique ?? '';
+  document.getElementById('ta_dia').value = patient.tension_diastolique ?? '';
+  document.getElementById('fc').value = patient.frequence_cardiaque ?? '';
+  document.getElementById('temp').value = patient.temperature ?? '';
+  document.getElementById('spo2').value = patient.spo2 ?? '';
+  document.getElementById('symptome_libre').value = patient.symptome_libre ?? '';
+  document.getElementById('antecedents').value = (patient.antecedents || []).join('\n');
+  document.getElementById('traitements').value = (patient.traitements_en_cours || []).join('\n');
+  document.getElementById('resultats_examens').value = Object.entries(patient.resultats_examens || {})
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\n');
+  setCheckedValues('s-', patient.symptomes || []);
+  setCheckedValues('e-', patient.examens_realises || []);
 }
 
 function getDemoResult(patient) {
@@ -621,15 +778,30 @@ function getDemoResult(patient) {
   const urgence = (hasChestPain && hasECG) ? 'critique' : hasChestPain ? 'eleve' : 'modere';
   return {
     diagnostic_preliminaire: hasChestPain ? 'Syndrome coronarien aigu probable — infarctus du myocarde à exclure en urgence' : 'Bilan complémentaire nécessaire pour orientation diagnostique',
+    diagnostic_credibilite: hasECG ? 0.78 : 0.45,
+    diagnostic_justification: hasChestPain
+      ? "Douleur thoracique avec elements potentiellement coronariens, a confirmer par ECG et biologie."
+      : "Donnees encore insuffisantes pour une hypothese solide, bilan complementaire necessaire.",
     diagnostics_differentiels: hasChestPain
-      ? ['Infarctus du myocarde (STEMI)', 'Syndrome coronarien sans sus-décalage (NSTEMI)', 'Péricardite aiguë']
-      : ['Trouble du rythme cardiaque', 'Insuffisance cardiaque décompensée', 'Pathologie infectieuse'],
+      ? [
+          { diagnostic: 'Infarctus du myocarde (STEMI)', credibilite: 0.42, justification: 'Compatible si douleur thoracique typique et anomalies ECG.' },
+          { diagnostic: 'Syndrome coronarien sans sus-décalage (NSTEMI)', credibilite: 0.28, justification: 'Possible si douleur thoracique sans sus-decalage franc.' },
+          { diagnostic: 'Péricardite aiguë', credibilite: 0.18, justification: 'Differentiel a discuter selon caractere de la douleur et contexte inflammatoire.' },
+        ]
+      : [
+          { diagnostic: 'Trouble du rythme cardiaque', credibilite: 0.22, justification: 'Peut expliquer des symptomes non specifiques sans donnees completes.' },
+          { diagnostic: 'Insuffisance cardiaque décompensée', credibilite: 0.16, justification: 'Possible selon dyspnee ou signes congestifs a documenter.' },
+          { diagnostic: 'Pathologie infectieuse', credibilite: 0.12, justification: 'A envisager selon temperature, syndrome inflammatoire ou foyer clinique.' },
+        ],
     questions_complementaires: [
       'La douleur irradie-t-elle dans le bras gauche ou la mâchoire ?',
       'Y a-t-il eu une douleur similaire dans les semaines précédentes ?',
       'Le patient a-t-il pris de la trinitrine avec soulagement ?',
     ],
     examens_proposes: ['Troponine urgente (si non fait)', 'ECG 12 dérivations répété à 30 min', 'Glycémie capillaire'],
+    traitements_proposes: hasChestPain
+      ? ['Mise au repos et surveillance rapprochee', 'Oxygene si desaturation', 'Avis medical urgent pour traitement specifique']
+      : ['Traitement symptomatique apres validation medicale', 'Surveillance des constantes', 'Reevaluation clinique rapide'],
     niveau_urgence: urgence,
     confiance: hasECG ? 0.85 : 0.62,
     modele_utilise: 'demo/offline'
@@ -639,7 +811,13 @@ function getDemoResult(patient) {
 function renderDiagnosticResult(data) {
   const urg = data.niveau_urgence || 'default';
   const confPct = Math.round((data.confiance || 0) * 100);
+  const credPct = (((data.diagnostic_credibilite || 0) * 100).toFixed(1));
   const confColor = confPct >= 70 ? 'var(--green)' : confPct >= 40 ? 'var(--amber)' : 'var(--red)';
+  const diffHtml = (data.diagnostics_differentiels || []).map(d => {
+    const pct = (((d && d.credibilite) || 0) * 100).toFixed(1);
+    const why = d?.justification ? `<div style="font-size:13px;color:var(--text-muted);margin-top:2px">${d.justification}</div>` : '';
+    return `<li><strong>${d?.diagnostic || ''}</strong> <span style="font-size:12px;color:var(--gray)">(${pct}%)</span>${why}</li>`;
+  }).join('');
 
   const html = `
     <div class="diagnostic-result ${urg}">
@@ -647,6 +825,10 @@ function renderDiagnosticResult(data) {
         <div class="result-main">${data.diagnostic_preliminaire}</div>
         <span class="badge badge-${urg}">${urg.toUpperCase()}</span>
       </div>
+      <div style="margin-top:8px;font-size:14px;color:var(--text-muted)">
+        Credibilite du diagnostic principal : <strong>${credPct}%</strong>
+      </div>
+      <div style="margin-top:6px;font-size:14px;line-height:1.6">${data.diagnostic_justification || ''}</div>
       <div class="confidence-bar">
         <div class="confidence-label">
           <span>Niveau de confiance</span>
@@ -661,7 +843,7 @@ function renderDiagnosticResult(data) {
     <div class="card" style="margin-top:16px">
       <div class="result-section">
         <div class="result-section-title">Diagnostics différentiels</div>
-        <ul class="result-list">${(data.diagnostics_differentiels||[]).map(d=>`<li>${d}</li>`).join('')}</ul>
+        <ul class="result-list">${diffHtml}</ul>
       </div>
       <div class="result-section">
         <div class="result-section-title">Questions à poser au patient</div>
@@ -671,11 +853,29 @@ function renderDiagnosticResult(data) {
         <div class="result-section-title">Examens proposés</div>
         <ul class="result-list">${(data.examens_proposes||[]).map(e=>`<li>${e}</li>`).join('')}</ul>
       </div>
+      <div class="result-section">
+        <div class="result-section-title">Conduite à tenir proposée</div>
+        <ul class="result-list">${(data.traitements_proposes||[]).map(t=>`<li>${t}</li>`).join('')}</ul>
+      </div>
       <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">
         Modèle : ${data.modele_utilise} · Ce diagnostic est préliminaire — validation médecin requise
       </div>
     </div>`;
   document.getElementById('diagnostic-output').innerHTML = html;
+}
+
+function renderDiagnosticError(message) {
+  document.getElementById('diagnostic-output').innerHTML = `
+    <div class="diagnostic-result critique">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div class="result-main">Erreur backend</div>
+        <span class="badge badge-critique">ERREUR</span>
+      </div>
+      <div style="margin-top:12px;font-size:14px;line-height:1.6;white-space:pre-wrap">${message}</div>
+      <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">
+        Verifiez la cle API, le fichier .env, puis redemarrez le backend.
+      </div>
+    </div>`;
 }
 
 // ── ECG ──
@@ -695,6 +895,7 @@ function handleECGDrop(e) {
 }
 
 async function analyzeECGFile(file) {
+  await previewSelectedECG(file);
   const formData = new FormData();
   formData.append('file', file);
   document.getElementById('loader-ecg').classList.add('active');
@@ -704,7 +905,6 @@ async function analyzeECGFile(file) {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     currentECGResult = data;
-    renderECGResult(data);
     showPage('p2-result');
   } catch (e) {
     alert(`Analyse ECG impossible: ${e.message}`);
@@ -716,8 +916,55 @@ async function analyzeECGFile(file) {
 function generateDemoECG() {
   const patho = document.getElementById('demo-pathologie').value;
   const data = generateSyntheticECG(patho);
+  currentECGPlotData = { leads: [{ name: 'II', signal: data.signal }] };
   drawECGPreview(data);
   analyzeECGLocally(data, patho);
+}
+
+async function previewSelectedECG(file) {
+  try {
+    const text = await file.text();
+    const plotData = parseECGSignal(text);
+    if (plotData.leads.length) {
+      currentECGPlotData = plotData;
+      drawECGPreview(plotData);
+    }
+  } catch (_) {
+    currentECGPlotData = null;
+  }
+}
+
+function parseECGSignal(text) {
+  const rows = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (!rows.length) return { leads: [] };
+
+  const delimiter = detectECGDelimiter(rows.slice(0, 5));
+  const parsedRows = rows.map(row => row.split(delimiter).map(cell => cell.trim()));
+  const header = parsedRows[0];
+  const hasHeader = header.some(cell => Number.isNaN(Number(String(cell).replace(',', '.'))));
+  const dataRows = hasHeader ? parsedRows.slice(1) : parsedRows;
+
+  const candidateIndexes = hasHeader ? selectLeadIndexes(header) : header.map((_, index) => index);
+  const leadNames = hasHeader
+    ? candidateIndexes.map(index => normalizeLeadName(header[index]))
+    : candidateIndexes.map((_, index) => `Lead ${index + 1}`);
+
+  const leadSignals = candidateIndexes.map(() => []);
+  for (const row of dataRows) {
+    candidateIndexes.forEach((columnIndex, leadIndex) => {
+      if (columnIndex >= row.length) return;
+      const value = Number(String(row[columnIndex]).replace(',', '.'));
+      if (!Number.isNaN(value)) {
+        leadSignals[leadIndex].push(value);
+      }
+    });
+  }
+
+  const leads = leadSignals
+    .map((signal, index) => ({ name: leadNames[index], signal: signal.slice(0, 5000) }))
+    .filter(lead => lead.signal.length);
+
+  return { leads: leads.slice(0, 12) };
 }
 
 function generateSyntheticECG(patho) {
@@ -765,35 +1012,76 @@ function generateLead(t, patho) {
 function drawECGPreview(data) {
   const card = document.getElementById('ecg-preview');
   card.style.display = 'block';
-  const canvas = document.getElementById('ecg-canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.offsetWidth * devicePixelRatio;
-  canvas.height = 140 * devicePixelRatio;
-  ctx.scale(devicePixelRatio, devicePixelRatio);
-  const w = canvas.offsetWidth, h = 140;
-  ctx.clearRect(0,0,w,h);
+  const plotData = data.leads ? data : { leads: [{ name: 'II', signal: data.signal || [] }] };
+  renderECGLeadGrid('ecg-preview-grid', plotData, 12);
+}
 
-  // Grille
-  ctx.strokeStyle = 'rgba(220,100,100,0.2)';
-  ctx.lineWidth = 0.5;
-  for (let x = 0; x < w; x += 20) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
-  for (let y = 0; y < h; y += 20) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
-  ctx.strokeStyle = 'rgba(220,100,100,0.4)';
-  for (let x = 0; x < w; x += 100) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
-  for (let y = 0; y < h; y += 100) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+function detectECGDelimiter(lines) {
+  const candidates = [',', ';', '\t', '|'];
+  const scores = candidates.map(candidate => ({
+    candidate,
+    score: lines.reduce((sum, line) => sum + (line.split(candidate).length - 1), 0),
+  }));
+  return scores.sort((a, b) => b.score - a.score)[0]?.candidate || ',';
+}
 
-  // Signal
-  const sig = data.signal.slice(0, 2500);
-  const mid = h / 2, scale = h * 0.32;
-  ctx.strokeStyle = '#1a1a1a';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  sig.forEach((v, i) => {
-    const x = i / sig.length * w;
-    const y = mid - v * scale;
-    i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+function normalizeLeadName(value) {
+  return String(value || '').trim().toUpperCase().replace(/[\s_-]+/g, '');
+}
+
+function selectLeadIndexes(header) {
+  const known = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'];
+  const normalized = header.map(cell => normalizeLeadName(cell));
+  const leadIndexes = normalized
+    .map((name, index) => known.includes(name) ? index : -1)
+    .filter(index => index >= 0);
+  if (leadIndexes.length) return leadIndexes;
+  return normalized
+    .map((name, index) => ['TIME', 'TEMPS', 'TIMESTAMP', 'SAMPLE', 'INDEX'].includes(name) ? -1 : index)
+    .filter(index => index >= 0);
+}
+
+function renderECGLeadGrid(containerId, plotData, limit = 12) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.style.display = 'grid';
+  container.style.gridTemplateColumns = 'minmax(0, 1fr)';
+  container.style.gap = '0';
+  container.style.border = '1px solid rgba(220,100,100,0.18)';
+  container.style.borderRadius = '10px';
+  container.style.overflow = 'hidden';
+  container.style.background = '#fff7f7';
+
+  const leadOrder = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'];
+  const sortedLeads = [...(plotData?.leads || [])].sort((a, b) => {
+    const ai = leadOrder.indexOf(normalizeLeadName(a.name));
+    const bi = leadOrder.indexOf(normalizeLeadName(b.name));
+    const aRank = ai === -1 ? 999 : ai;
+    const bRank = bi === -1 ? 999 : bi;
+    return aRank - bRank;
   });
-  ctx.stroke();
+  const leads = sortedLeads.slice(0, limit);
+  if (!leads.length) {
+    container.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Aucune derivation exploitable detectee.</div>`;
+    return;
+  }
+
+  container.innerHTML = leads.map((lead, index) => `
+    <div style="padding:0;border-bottom:${index < leads.length - 1 ? '1px solid rgba(220,100,100,0.18)' : 'none'};min-height:106px;">
+      <div style="font-size:12px;font-weight:600;color:#4d7ea8;padding:6px 10px 0 10px">${formatLeadLabel(lead.name || `Lead ${index + 1}`)}</div>
+      <canvas id="${containerId}-canvas-${index}" style="width:100%;height:84px;background:#fff7f7;display:block;"></canvas>
+    </div>
+  `).join('');
+
+  leads.forEach((lead, index) => {
+    drawECGCanvas(document.getElementById(`${containerId}-canvas-${index}`), lead.signal, 84);
+  });
+}
+
+function formatLeadLabel(name) {
+  const normalized = normalizeLeadName(name);
+  if (['AVR', 'AVL', 'AVF'].includes(normalized)) return `a${normalized.slice(1).toLowerCase()}`;
+  return normalized || name;
 }
 
 function analyzeECGLocally(data, truePatho) {
@@ -802,7 +1090,6 @@ function analyzeECGLocally(data, truePatho) {
     document.getElementById('loader-ecg').classList.remove('active');
     const result = classifyECG(data.signal, truePatho);
     currentECGResult = result;
-    renderECGResult(result);
     showPage('p2-result');
   }, 800);
 }
@@ -921,6 +1208,14 @@ function renderECGResult(data) {
   const urgClass = data.pathologie_id === 'infarctus_du_myocarde' || data.pathologie_id === 'tachycardie_ventriculaire' ? 'critique' :
     data.pathologie_id === 'fibrillation_auriculaire' || data.pathologie_id === 'ischemie_myocardique' ? 'eleve' :
     data.pathologie_id === 'normal' ? 'faible' : 'modere';
+  const feats = data.features_extraites || {};
+  const meta = data.ecg_metadata || {};
+  const stMean = feats.st_mean_deviation_mm ?? feats.st_mean_deviation ?? 0;
+  const method = data.methode || 'non renseignee';
+  const leadCount = meta.original_lead_count ?? 'NC';
+  const leadNames = (meta.detected_leads || []).join(', ');
+  const isTwelveLead = Boolean(meta.is_twelve_lead);
+  const interpretation = data.interpretation || '';
 
   const probaHtml = topProbs.map(([name, prob]) => {
     const pct = Math.round(prob * 100);
@@ -931,7 +1226,6 @@ function renderECGResult(data) {
     </div>`;
   }).join('');
 
-  const feats = data.features_extraites;
   document.getElementById('ecg-output').innerHTML = `
     <div class="diagnostic-result ${urgClass}">
       <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
@@ -943,6 +1237,16 @@ function renderECGResult(data) {
         <div class="confidence-track"><div class="confidence-fill" style="width:${confPct}%"></div></div>
       </div>
       <div style="margin-top:12px;font-size:14px;line-height:1.5">${data.recommandation}</div>
+      <div style="margin-top:10px;font-size:14px;line-height:1.5;color:var(--text-muted)">${interpretation}</div>
+      ${!isTwelveLead ? `<div style="margin-top:12px;padding:12px;border:1px solid #f5c06a;border-radius:10px;background:#fff7e8;color:#8a5a00;font-size:13px;line-height:1.5">ECG incomplet : ${leadCount} derivations reelles detectees${leadNames ? ` (${leadNames})` : ''}. Un diagnostic d'infarctus doit etre confirme sur un ECG 12 derivations.</div>` : ''}
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">ECG selectionne</div>
+      <div id="ecg-result-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;"></div>
+      <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">
+        Derivations detectees : ${leadCount}${leadNames ? ` · ${leadNames}` : ''} · Methode : ${method}
+      </div>
     </div>
 
     <div class="card" style="margin-top:16px">
@@ -955,12 +1259,64 @@ function renderECGResult(data) {
       <div class="feature-grid">
         <div class="feature-item"><div class="feature-key">Fréquence cardiaque</div><div class="feature-val">${feats.heart_rate_bpm} bpm</div></div>
         <div class="feature-item"><div class="feature-key">Irrégularité RR</div><div class="feature-val">${feats.rr_irregularity_ratio}</div></div>
-        <div class="feature-item"><div class="feature-key">Déviation ST moyenne</div><div class="feature-val">${feats.st_mean_deviation} mV</div></div>
+        <div class="feature-item"><div class="feature-key">Déviation ST moyenne</div><div class="feature-val">${stMean} mV</div></div>
       </div>
       <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">
-        Méthode : ${data.methode} · Branchement CNN disponible après entraînement sur les 30 000 ECG
+        Méthode : ${method} · Branchement CNN disponible après entraînement sur les 30 000 ECG
       </div>
     </div>`;
+
+  if (currentECGPlotData?.leads?.length) {
+    renderECGLeadGrid('ecg-result-grid', currentECGPlotData, 12);
+  }
+}
+
+function drawECGCanvas(canvas, signal, height = 180) {
+  if (!canvas || !signal?.length) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * devicePixelRatio;
+  canvas.height = height * devicePixelRatio;
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  const w = canvas.offsetWidth;
+  const h = height;
+  ctx.clearRect(0,0,w,h);
+
+  ctx.strokeStyle = 'rgba(230,140,140,0.12)';
+  ctx.lineWidth = 0.5;
+  for (let x = 0; x < w; x += 12) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y = 0; y < h; y += 12) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+  ctx.strokeStyle = 'rgba(230,140,140,0.22)';
+  for (let x = 0; x < w; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y = 0; y < h; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+
+  const preview = signal.slice(0, 5000);
+  const centered = centerSignal(preview);
+  const dynamicAmp = estimateDisplayAmplitude(centered);
+  const mid = h / 2;
+  const scale = (h * 0.38) / Math.max(dynamicAmp, 0.2);
+  ctx.strokeStyle = '#2a2a2a';
+  ctx.lineWidth = 1.3;
+  ctx.beginPath();
+  centered.forEach((v, i) => {
+    const x = (i / Math.max(preview.length - 1, 1)) * w;
+    const y = mid - v * scale;
+    i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+}
+
+function centerSignal(signal) {
+  if (!signal.length) return [];
+  const sorted = [...signal].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] || 0;
+  return signal.map(v => v - median);
+}
+
+function estimateDisplayAmplitude(signal) {
+  if (!signal.length) return 1;
+  const abs = signal.map(v => Math.abs(v)).sort((a, b) => a - b);
+  const idx = Math.min(abs.length - 1, Math.floor(abs.length * 0.95));
+  return abs[idx] || 1;
 }
 
 // ── VUE MÉDECIN ──
@@ -1065,6 +1421,7 @@ function loadStats() {
 
 // ── INIT ──
 initGrids();
+refreshClinicalCases();
 </script>
 </body>
 </html>

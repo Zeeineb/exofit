@@ -84,6 +84,8 @@ def load_patient_file(file_bytes: bytes, filename: str) -> dict[str, Any]:
             payload = payload[0]
         if not isinstance(payload, dict):
             raise ValueError("Le fichier JSON doit contenir un objet patient")
+        if isinstance(payload.get("patient"), dict):
+            payload = payload["patient"]
         return normalize_patient_data(payload)
 
     if suffix in {".csv", ".tsv"}:
@@ -281,26 +283,16 @@ def _detect_delimiter(text: str) -> str:
 
 
 def _extract_docx_text(file_bytes: bytes) -> str:
-    try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
-            xml_content = archive.read("word/document.xml")
-    except (KeyError, zipfile.BadZipFile) as exc:
-        raise ValueError("Fichier DOCX invalide ou corrompu") from exc
+    paragraphs: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+        with archive.open("word/document.xml") as handle:
+            xml_bytes = handle.read()
 
-    root = ET.fromstring(xml_content)
-    paragraphs = []
+    root = ET.fromstring(xml_bytes)
     namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-
     for paragraph in root.findall(".//w:p", namespace):
-        chunks = []
-        for text_node in paragraph.findall(".//w:t", namespace):
-            if text_node.text:
-                chunks.append(text_node.text)
-        line = "".join(chunks).strip()
-        if line:
-            paragraphs.append(line)
-
-    if not paragraphs:
-        raise ValueError("Le fichier DOCX ne contient pas de texte exploitable")
-
+        runs = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+        text = "".join(runs).strip()
+        if text:
+            paragraphs.append(text)
     return "\n".join(paragraphs)

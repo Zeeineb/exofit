@@ -411,6 +411,7 @@ def predict_pathology(preprocessed: dict) -> dict:
     import os
     features = preprocessed["features"]
     signal_data = preprocessed["signal"]
+    metadata = preprocessed.get("metadata") or {}
 
     # Essayer le CNN d'abord
     model = load_model_weights()
@@ -431,20 +432,32 @@ def predict_pathology(preprocessed: dict) -> dict:
     best_pathologie = max(probs, key=probs.get)
     confiance = probs[best_pathologie]
 
+    is_twelve_lead = bool(metadata.get("is_twelve_lead"))
+    if best_pathologie in {"infarctus_du_myocarde", "ischemie_myocardique"} and not is_twelve_lead:
+        best_pathologie = "ischemie_myocardique"
+        confiance = min(confiance, 0.45)
+        probs["ischemie_myocardique"] = max(probs.get("ischemie_myocardique", 0.0), confiance)
+        if "infarctus_du_myocarde" in probs:
+            probs["infarctus_du_myocarde"] = min(probs["infarctus_du_myocarde"], confiance)
+
     # Recommandation clinique
-    recommandation = _get_recommandation(best_pathologie, confiance)
+    recommandation = _get_recommandation(best_pathologie, confiance, is_twelve_lead=is_twelve_lead)
+    interpretation = _build_interpretation(best_pathologie, features, metadata)
 
     return {
         "pathologie_detectee": PATHOLOGIE_LABELS[best_pathologie],
+        "pathologie_id": best_pathologie,
         "probabilites": {PATHOLOGIE_LABELS[k]: v for k, v in probs.items()},
         "features_extraites": features,
         "confiance": round(confiance, 3),
         "recommandation": recommandation,
+        "interpretation": interpretation,
         "methode": methode,
+        "ecg_metadata": metadata,
     }
 
 
-def _get_recommandation(pathologie: str, confiance: float) -> str:
+def _get_recommandation(pathologie: str, confiance: float, is_twelve_lead: bool = True) -> str:
     recommandations = {
         "infarctus_du_myocarde":         "URGENCE ABSOLUE — Appeler SAMU, aspiriné 250mg, défibrillateur en standby",
         "tachycardie_ventriculaire":      "URGENCE — Monitoring continu, préparer choc électrique externe",
@@ -456,9 +469,44 @@ def _get_recommandation(pathologie: str, confiance: float) -> str:
         "normal":                         "ECG dans les limites normales — poursuivre bilan clinique",
     }
     base = recommandations.get(pathologie, "Téléconsultation médicale recommandée")
+    if pathologie in {"infarctus_du_myocarde", "ischemie_myocardique"} and not is_twelve_lead:
+        base = "ECG incomplet: un ECG 12 dérivations est requis avant de conclure sur un infarctus. Orientation urgente si douleur thoracique ou signes associés."
     if confiance < 0.5:
         base += " (confiance faible — interprétation à valider par médecin)"
     return base
+
+
+def _build_interpretation(pathologie: str, features: dict, metadata: dict) -> str:
+    hr = features.get("heart_rate_bpm", 0)
+    irr = features.get("rr_irregularity_ratio", 0.0)
+    qrs = features.get("qrs_width_ms", 0.0)
+    st = features.get("st_mean_deviation_mm", 0.0)
+    lead_count = metadata.get("original_lead_count", 0)
+
+    fragments = []
+    if hr:
+        fragments.append(f"FC {hr} bpm")
+    if irr:
+        fragments.append(f"irrégularité RR {irr:.3f}")
+    if qrs:
+        fragments.append(f"QRS {qrs:.0f} ms")
+    fragments.append(f"ST moyen {st:.2f} mV")
+
+    summary = ", ".join(fragments)
+    if pathologie == "infarctus_du_myocarde":
+        return f"Sus-décalage ST compatible avec un syndrome coronarien aigu. Interprétation fondée sur {summary}."
+    if pathologie == "ischemie_myocardique":
+        note = f"Anomalie ST à confirmer. Analyse fondée sur {summary}."
+        if lead_count and lead_count < 12:
+            note += f" Le fichier ne comporte que {lead_count} dérivations réelles; un ECG 12 dérivations est nécessaire pour discuter un infarctus."
+        return note
+    if pathologie == "fibrillation_auriculaire":
+        return f"Rythme irrégulier avec variabilité RR augmentée. Analyse fondée sur {summary}."
+    if pathologie == "tachycardie_ventriculaire":
+        return f"Tachycardie avec QRS élargis. Analyse fondée sur {summary}."
+    if pathologie == "bradycardie":
+        return f"Fréquence cardiaque lente sans autre argument majeur. Analyse fondée sur {summary}."
+    return f"Analyse ECG fondée sur {summary}."
 
 
 # ─── DONNÉES SYNTHÉTIQUES (pour tests sans CSV réel) ──────────────────────

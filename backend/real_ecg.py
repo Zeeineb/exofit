@@ -18,14 +18,19 @@ TIME_COLUMN_NAMES = {"time", "temps", "timestamp", "sample", "index"}
 
 
 def preprocess_real_ecg(file_bytes: bytes) -> dict:
-    raw = read_real_ecg_table(file_bytes)
+    parsed = read_real_ecg_table(file_bytes)
+    raw = parsed["signal"]
     filtered = bandpass_filter(raw)
     filtered = notch_filter(filtered)
     features = extract_features(filtered)
-    return {"features": features, "signal": filtered}
+    return {
+        "features": features,
+        "signal": filtered,
+        "metadata": parsed["metadata"],
+    }
 
 
-def read_real_ecg_table(file_bytes: bytes) -> np.ndarray:
+def read_real_ecg_table(file_bytes: bytes) -> dict:
     content = file_bytes.decode("utf-8-sig", errors="replace")
     lines = [line for line in content.splitlines() if line.strip()]
     if not lines:
@@ -40,9 +45,15 @@ def read_real_ecg_table(file_bytes: bytes) -> np.ndarray:
     header = rows[0]
     signal_rows = rows
     selected_indexes = None
+    selected_names = []
 
     if _looks_like_header(header):
         selected_indexes = _select_signal_columns(header)
+        selected_names = [
+            _normalize_column_name(header[idx])
+            for idx in selected_indexes
+            if idx < len(header)
+        ]
         signal_rows = rows[1:]
 
     samples = []
@@ -63,12 +74,24 @@ def read_real_ecg_table(file_bytes: bytes) -> np.ndarray:
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
 
+    original_lead_count = int(arr.shape[1])
+    detected_leads = [
+        name.upper()
+        for name in selected_names
+        if name in LEAD_NAMES
+    ]
     if arr.shape[1] < 12:
         arr = np.tile(arr, (1, 12 // arr.shape[1] + 1))[:, :12]
     elif arr.shape[1] > 12:
         arr = arr[:, :12]
 
-    return arr
+    metadata = {
+        "original_lead_count": original_lead_count,
+        "detected_leads": detected_leads,
+        "is_twelve_lead": original_lead_count >= 12 and _has_all_standard_leads(detected_leads),
+    }
+
+    return {"signal": arr, "metadata": metadata}
 
 
 def _extract_row_values(row: list[str], selected_indexes: list[int] | None) -> list[float]:
@@ -115,3 +138,10 @@ def _safe_float(value: str) -> float | None:
         return float(text.replace(",", "."))
     except (TypeError, ValueError):
         return None
+
+
+def _has_all_standard_leads(detected_leads: list[str]) -> bool:
+    if not detected_leads:
+        return False
+    expected = {"I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"}
+    return expected.issubset(set(detected_leads))

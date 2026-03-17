@@ -78,7 +78,7 @@ Puis ouvrir `http://localhost:3000`.
 Deux modes sont disponibles :
 
 1. saisie manuelle du patient dans l'interface
-2. import d'un dossier clinique via un fichier `JSON`, `CSV`, `TSV`, `TXT`, `MD` ou `DOCX`
+2. import d'un dossier clinique via un fichier `JSON`, `CSV`, `TSV`, `TXT` ou `MD`
 
 Le frontend appelle :
 
@@ -116,7 +116,7 @@ Champs reconnus automatiquement :
 - `examens_realises`
 - `resultats_examens`
 
-Exemple `TXT` ou contenu `DOCX` :
+Exemple `TXT` :
 
 ```txt
 age: 58

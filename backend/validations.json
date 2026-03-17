@@ -1,0 +1,23 @@
+[
+  {
+    "cas_id": "cas_1773749465299",
+    "diagnostic_valide": true,
+    "diagnostic_corrige": null,
+    "commentaire": "",
+    "medecin_id": "medecin_1"
+  },
+  {
+    "cas_id": "10_petits_cas_cliniques_cas_008",
+    "diagnostic_valide": true,
+    "diagnostic_corrige": null,
+    "commentaire": "",
+    "medecin_id": "medecin_1"
+  },
+  {
+    "cas_id": "10_petits_cas_cliniques_cas_001",
+    "diagnostic_valide": false,
+    "diagnostic_corrige": "",
+    "commentaire": "",
+    "medecin_id": "medecin_1"
+  }
+]

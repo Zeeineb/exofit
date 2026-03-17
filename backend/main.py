@@ -4,7 +4,7 @@ Partie 1 : Diagnostic IA (infirmière + LLM + télémédecin)
 Partie 2 : Analyse ECG automatique
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,7 +20,7 @@ from real_ecg import preprocess_real_ecg
 
 app = FastAPI(title="EXOFIT API", version="1.0.0")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PARSED_CASES_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "cas_cliniques", "parsed"))
+RAW_CASES_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "cas_cliniques", "raw"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,11 +48,19 @@ class PatientData(BaseModel):
     examens_realises: list[str] = Field(default_factory=list)  # ex: ["ecg", "nfs", "crp"]
     resultats_examens: dict = Field(default_factory=dict)      # ex: {"crp": "45 mg/L", "nfs": "Hb 10g/dL"}
 
+class DifferentialDiagnosis(BaseModel):
+    diagnostic: str
+    credibilite: float
+    justification: str
+
 class DiagnosticResponse(BaseModel):
     diagnostic_preliminaire: str
-    diagnostics_differentiels: list[str]
+    diagnostic_credibilite: float
+    diagnostic_justification: str
+    diagnostics_differentiels: list[DifferentialDiagnosis]
     questions_complementaires: list[str]
     examens_proposes: list[str]
+    traitements_proposes: list[str]
     niveau_urgence: str              # "faible" | "modere" | "eleve" | "critique"
     confiance: float                 # 0.0 à 1.0
     modele_utilise: str
@@ -66,15 +74,22 @@ class ValidationMedecin(BaseModel):
 
 class ECGDiagnosticResponse(BaseModel):
     pathologie_detectee: str
+    pathologie_id: str
     probabilites: dict[str, float]   # {"fibrillation_auriculaire": 0.87, ...}
     features_extraites: dict
     confiance: float
     recommandation: str
+    interpretation: str
+    methode: str
+    ecg_metadata: dict
+
+
+PARSED_CASES_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "cas_cliniques", "parsed"))
 
 # ─── ROUTES PARTIE 1 : DIAGNOSTIC IA ─────────────────────────────────────
 
 @app.post("/api/diagnostic", response_model=DiagnosticResponse)
-async def obtenir_diagnostic(patient: PatientData):
+async def obtenir_diagnostic(patient: PatientData, provider: Optional[str] = Query(default=None)):
     """
     Reçoit les données patient de l'infirmière,
     génère un prompt structuré, appelle le LLM,
@@ -82,14 +97,17 @@ async def obtenir_diagnostic(patient: PatientData):
     """
     try:
         prompt = build_prompt(patient.dict())
-        resultat = await call_llm(prompt)
+        resultat = await call_llm(prompt, provider=provider or None)
         return DiagnosticResponse(**resultat)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/diagnostic/from-file", response_model=DiagnosticResponse)
-async def obtenir_diagnostic_depuis_fichier(file: UploadFile = File(...)):
+async def obtenir_diagnostic_depuis_fichier(
+    file: UploadFile = File(...),
+    provider: Optional[str] = Query(default=None),
+):
     """
     Charge un cas clinique reel depuis un fichier JSON, CSV, TSV, TXT ou MD,
     puis applique le meme moteur de diagnostic que la saisie manuelle.
@@ -98,7 +116,55 @@ async def obtenir_diagnostic_depuis_fichier(file: UploadFile = File(...)):
     try:
         patient = load_patient_file(contenu, file.filename or "")
         prompt = build_prompt(patient)
-        resultat = await call_llm(prompt)
+        resultat = await call_llm(prompt, provider=provider or None)
+        return DiagnosticResponse(**resultat)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/clinical-documents")
+async def list_clinical_documents():
+    """
+    Liste les documents cliniques bruts disponibles sur disque.
+    """
+    if not os.path.isdir(RAW_CASES_DIR):
+        return {"documents": [], "count": 0, "directory": RAW_CASES_DIR}
+
+    docs = []
+    for name in sorted(os.listdir(RAW_CASES_DIR)):
+        if not name.lower().endswith((".docx", ".json", ".csv", ".tsv", ".txt", ".md")):
+            continue
+        docs.append(
+            {
+                "id": name,
+                "filename": name,
+                "path": os.path.join(RAW_CASES_DIR, name),
+            }
+        )
+    return {"documents": docs, "count": len(docs), "directory": RAW_CASES_DIR}
+
+
+@app.post("/api/diagnostic/from-document", response_model=DiagnosticResponse)
+async def obtenir_diagnostic_depuis_document(
+    filename: str = Query(...),
+    provider: Optional[str] = Query(default=None),
+):
+    """
+    Charge un document clinique brut depuis data/cas_cliniques/raw puis lance le diagnostic.
+    """
+    safe_name = os.path.basename(filename)
+    path = os.path.join(RAW_CASES_DIR, safe_name)
+    if safe_name != filename or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Document clinique introuvable")
+
+    try:
+        with open(path, "rb") as handle:
+            contenu = handle.read()
+        patient = load_patient_file(contenu, safe_name)
+        prompt = build_prompt(patient)
+        resultat = await call_llm(prompt, provider=provider or None)
         return DiagnosticResponse(**resultat)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -111,33 +177,33 @@ async def list_clinical_cases():
     """
     Liste les cas cliniques parses disponibles sur disque.
     """
-    if not os.path.isdir(PARSED_CASES_DIR):
-        return {"cases": [], "count": 0, "directory": PARSED_CASES_DIR}
+    cases_dir = os.path.abspath(PARSED_CASES_DIR)
+    if not os.path.isdir(cases_dir):
+        return {"cases": [], "count": 0, "directory": cases_dir}
 
-    cases = []
-    for name in sorted(os.listdir(PARSED_CASES_DIR)):
+    files = []
+    for name in sorted(os.listdir(cases_dir)):
         if not name.endswith(".json") or name == "index.json":
             continue
-        cases.append(
+        path = os.path.join(cases_dir, name)
+        files.append(
             {
                 "id": name[:-5],
                 "filename": name,
-                "path": os.path.join(PARSED_CASES_DIR, name),
+                "path": path,
             }
         )
-
-    return {"cases": cases, "count": len(cases), "directory": PARSED_CASES_DIR}
+    return {"cases": files, "count": len(files), "directory": cases_dir}
 
 
 @app.get("/api/clinical-cases/{case_id}")
 async def get_clinical_case(case_id: str):
     """
-    Retourne un cas clinique parse depuis data/cas_cliniques/parsed.
+    Charge un cas clinique parse depuis data/cas_cliniques/parsed.
     """
-    path = os.path.join(PARSED_CASES_DIR, f"{case_id}.json")
+    path = os.path.abspath(os.path.join(PARSED_CASES_DIR, f"{case_id}.json"))
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Cas clinique introuvable")
-
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
